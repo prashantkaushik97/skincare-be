@@ -1,9 +1,8 @@
 from flask import Blueprint, request, jsonify
 from app.utils.firebase import firebase_auth, firestore_client
-from google.cloud import firestore  # <-- add this import
+from google.cloud import firestore
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/api")
-
 @auth_bp.route("/login", methods=["POST"])
 def login():
     auth_header = request.headers.get("Authorization")
@@ -15,13 +14,17 @@ def login():
         decoded_token = firebase_auth.verify_id_token(id_token)
         uid = decoded_token["uid"]
         email = decoded_token.get("email", "")
-        name = decoded_token.get("name", "")
 
+        # 🆕 Get name from POST body
+        data = request.get_json()
+        name = data.get("name", "")
+
+        # Store in Firestore
         user_ref = firestore_client.collection("users").document(uid)
         user_ref.set({
             "email": email,
             "name": name,
-            "lastLogin": firestore.SERVER_TIMESTAMP  # ✅ Fix here
+            "lastLogin": firestore.SERVER_TIMESTAMP
         }, merge=True)
 
         return jsonify({"message": "Welcome!", "uid": uid}), 200
