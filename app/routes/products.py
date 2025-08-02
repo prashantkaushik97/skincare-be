@@ -1,8 +1,9 @@
 from flask import Blueprint, request, jsonify
 from app.utils.firebase import firebase_auth, firestore_client
-
+from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 
 products_bp = Blueprint("products", __name__, url_prefix="/api")
+
 
 @products_bp.route("/products", methods=["GET"])
 def get_products():
@@ -18,12 +19,32 @@ def get_products():
         return jsonify({"error": str(e)}), 401
 
     try:
-        products_ref = firestore_client.collection("products")
-        products = [doc.to_dict() for doc in products_ref.stream()]
-        
+        user_links = list(
+            firestore_client.collection("user_products")
+            .where("uid", "==", uid)
+            .stream()
+        )
+        print(f"User links found: {len(user_links)}")
+        product_ids = list({
+            doc.to_dict().get("product_id")
+            for doc in user_links
+            if doc.to_dict().get("product_id")
+        })
+
+        products = []
+        for pid in product_ids:
+            doc = firestore_client.collection("products").document(pid).get()
+            if doc.exists:
+                product_data = doc.to_dict()
+                product_data["id"] = pid
+                products.append(product_data)
+        print(f"Products found: {len(products)}")
+        print(f"Products: {products}")
         return jsonify({"products": products}), 200
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @products_bp.route("/products/<product_id>", methods=["GET"])
 def get_product(product_id):
@@ -41,13 +62,18 @@ def get_product(product_id):
     try:
         product_ref = firestore_client.collection("products").document(product_id)
         product = product_ref.get()
-        
+
         if not product.exists:
             return jsonify({"error": "Product not found"}), 404
-        
-        return jsonify({"product": product.to_dict()}), 200
+
+        product_data = product.to_dict()
+        product_data["id"] = product_id
+        return jsonify({"product": product_data}), 200
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
 @products_bp.route("/products", methods=["POST"])
 def add_product():
     auth_header = request.headers.get("Authorization")
@@ -63,17 +89,45 @@ def add_product():
 
     try:
         data = request.get_json()
-        product_data = {
-            "name": data.get("name"),
-            # "description": data.get("description"),
-            # "price": data.get("price"),
-            "category": data.get("category"),
-            # "image_url": data.get("imageUrl")
-        }
+        name = data.get("name")
+        category = data.get("category")
+        brand = data.get("brand") or ""
 
+
+        if not name or not category:
+            return jsonify({"error": "Missing required fields"}), 400
+
+        # Step 1: Check if product exists
         products_ref = firestore_client.collection("products")
-        products_ref.add(product_data)
+        query = products_ref.where("name", "==", name).where("category", "==", category).limit(1)
+        result = query.stream()
+        product_doc = next(result, None)
 
-        return jsonify({"message": "Product added successfully"}), 201
+        if product_doc:
+            product_id = product_doc.id
+        else:
+            # Step 2: Add new product
+            new_product_ref = products_ref.document()
+            new_product_ref.set({
+                "name": name,
+                "category": category,
+                "brand": brand
+            })
+            product_id = new_product_ref.id
+
+        # Step 3: Link product to user (ensure unique document per uid-product)
+        user_products_ref = firestore_client.collection("user_products")
+        link_doc_id = f"{uid}_{product_id}"
+        link_doc = user_products_ref.document(link_doc_id)
+
+        if not link_doc.get().exists:
+            link_doc.set({
+                "uid": uid,
+                "product_id": product_id,
+                "added_at": SERVER_TIMESTAMP
+            })
+
+        return jsonify({"message": "Product added/linked successfully", "product_id": product_id}), 201
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
