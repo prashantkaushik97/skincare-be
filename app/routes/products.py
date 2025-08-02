@@ -24,7 +24,6 @@ def get_products():
             .where("uid", "==", uid)
             .stream()
         )
-        print(f"User links found: {len(user_links)}")
         product_ids = list({
             doc.to_dict().get("product_id")
             for doc in user_links
@@ -38,8 +37,7 @@ def get_products():
                 product_data = doc.to_dict()
                 product_data["id"] = pid
                 products.append(product_data)
-        print(f"Products found: {len(products)}")
-        print(f"Products: {products}")
+
         return jsonify({"products": products}), 200
 
     except Exception as e:
