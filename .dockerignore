@@ -1,0 +1,29 @@
+# local/IDE stuff
+.vscode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# virtual envs
+venv/
+.env
+.env.*
+.venv/
+
+# git
+.git
+.gitignore
+
+# OS
+.DS_Store
+
+# build artifacts
+dist/
+build/
+
+# DO NOT bake secrets into the image
+serviceAccount.json
+*.pem
+*.key
+*.crt
