@@ -36,7 +36,7 @@ def save_profile():
                 "additionalNotes": additional
             }
         }, merge=True)
-
+        print(f"Saved profile for user {uid}")
         return jsonify({"message": "Profile saved"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500

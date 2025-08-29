@@ -1,29 +1,10 @@
-# local/IDE stuff
-.vscode
+venv/
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-
-# virtual envs
-venv/
-.env
-.env.*
-.venv/
-
-# git
 .git
 .gitignore
-
-# OS
+.vscode
 .DS_Store
-
-# build artifacts
-dist/
-build/
-
-# DO NOT bake secrets into the image
+.env
+.env.*
 serviceAccount.json
-*.pem
-*.key
-*.crt
