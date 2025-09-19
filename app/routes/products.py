@@ -90,8 +90,7 @@ def add_product():
         name = data.get("name")
         category = data.get("category")
         brand = data.get("brand") or ""
-
-
+        print(data)
         if not name or not category:
             return jsonify({"error": "Missing required fields"}), 400
 
@@ -126,6 +125,34 @@ def add_product():
             })
 
         return jsonify({"message": "Product added/linked successfully", "product_id": product_id}), 201
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@products_bp.route("/products/<product_id>", methods=["DELETE"])
+def delete_product(product_id):
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return jsonify({"error": "Missing token"}), 401
+
+    id_token = auth_header.split(" ").pop()
+    try:
+        decoded_token = firebase_auth.verify_id_token(id_token)
+        uid = decoded_token["uid"]
+    except Exception as e:
+        return jsonify({"error": str(e)}), 401
+
+    try:
+        # Delete the user-product link
+        user_products_ref = firestore_client.collection("user_products")
+        link_doc_id = f"{uid}_{product_id}"
+        link_doc = user_products_ref.document(link_doc_id)
+
+        if link_doc.get().exists:
+            link_doc.delete()
+            return jsonify({"message": "Product unlinked from user successfully"}), 200
+        else:
+            return jsonify({"error": "Product link not found for user"}), 404
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
