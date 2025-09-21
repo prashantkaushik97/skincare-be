@@ -269,8 +269,12 @@ def generate_routine():
         routine = _normalize_routine(snap.to_dict())
         routine["plan"] = generated_plan
         doc_ref.set(routine)
+        print(f"Generated routine for user {uid}: {generated_plan}")
+        return jsonify({
+            "message": "New routine generated and saved.",
+            "routine": generated_plan        
+        }), 200
 
-        return jsonify({"message": "New routine generated and saved.", "routine": {"plan": generated_plan}}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
