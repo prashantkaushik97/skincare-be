@@ -3,11 +3,12 @@ from flask import Blueprint, request, jsonify
 import os, json, requests
 from app.utils.firebase import firebase_auth, firestore_client
 from google.cloud import firestore
+from datetime import datetime, timedelta
+
 API_KEY = os.getenv("GEMINI_API_KEY")
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent"
 
 routine_bp = Blueprint("routine", __name__, url_prefix="/api")
-
 
 # ----------------------------- Helpers -----------------------------
 
@@ -22,21 +23,49 @@ def _bearer_uid_or_401():
     except Exception as e:
         return None, (jsonify({"error": str(e)}), 401)
 
-
 def _normalize_routine(r):
-    """Always return a dict with time/products/plan keys."""
     r = r or {}
     time = r.get("time") or ["morning", "evening"]
-    products = r.get("products") or []        # list of {"id": "..."}
-    plan = r.get("plan") or {}                # {"morning":[{name,order}], "evening":[...]}
+    prod = r.get("products") or {}
+    plan = r.get("plan") or {}
+    if isinstance(prod, dict):
+        am = prod.get("am") or []
+        pm = prod.get("pm") or []
+    else:
+        am, pm = (prod or []), []
+    def _clean(arr):
+        out = []
+        for p in arr:
+            pid = (p.get("id") or "").strip()
+            if pid:
+                out.append({"id": pid})
+        return out
+    products = {"am": _clean(am), "pm": _clean(pm)}
     return {"time": time, "products": products, "plan": plan}
 
+def _today_date_str():
+    return datetime.utcnow().strftime("%Y-%m-%d")
 
+def _month_range(year, month):
+    start = datetime(year, month, 1)
+    end = datetime(year + (month==12), 1 if month==12 else month+1, 1)
+    days = (end - start).days
+    return [start + timedelta(days=i) for i in range(days)]
+
+# --------- New collection refs ----------
+def _routine_doc(uid):
+    # current routine per user (small, hot)
+    return firestore_client.collection("user_routines").document(uid)
+
+def _status_doc_id(uid, date_str):
+    # flat collection for easy TTL/archival and CG queries
+    return f"{uid}_{date_str}"
+
+def _status_doc(date_str, uid):
+    return firestore_client.collection("user_routine_status").document(_status_doc_id(uid, date_str))
+
+# ----------------------------- OpenAI helper (unchanged) -----------------------------
 def create_routine_openai(products):
-    """
-    Generates morning/evening routine using Gemini.
-    products: list of dicts with at least name (id/brand/category optional)
-    """
     product_list = "\n".join([f"- {p.get('name', 'Unknown Product')}" for p in products])
     user_query = (
         "I have the following products:\n"
@@ -46,44 +75,16 @@ def create_routine_openai(products):
         "The order should be a number (1, 2, 3...). Provide the output in JSON format with "
         "'morning' and 'evening' keys."
     )
-
     response_schema = {
         "type": "OBJECT",
         "properties": {
-            "morning": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "name": {"type": "STRING"},
-                        "order": {"type": "NUMBER"}
-                    },
-                    "propertyOrdering": ["name", "order"]
-                }
-            },
-            "evening": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "name": {"type": "STRING"},
-                        "order": {"type": "NUMBER"}
-                    },
-                    "propertyOrdering": ["name", "order"]
-                }
-            }
+            "morning": {"type": "ARRAY","items":{"type":"OBJECT","properties":{"name":{"type":"STRING"},"order":{"type":"NUMBER"}},"propertyOrdering":["name","order"]}},
+            "evening": {"type": "ARRAY","items":{"type":"OBJECT","properties":{"name":{"type":"STRING"},"order":{"type":"NUMBER"}},"propertyOrdering":["name","order"]}}
         },
         "propertyOrdering": ["morning", "evening"]
     }
-
-    payload = {
-        "contents": [{"parts": [{"text": user_query}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": response_schema
-        }
-    }
-
+    payload = {"contents":[{"parts":[{"text": user_query}]}],
+               "generationConfig":{"responseMimeType":"application/json","responseSchema":response_schema}}
     try:
         resp = requests.post(f"{API_URL}?key={API_KEY}", json=payload)
         resp.raise_for_status()
@@ -97,11 +98,14 @@ def create_routine_openai(products):
         print(f"Failed to parse API response: {e}")
         return {"error": "Invalid API response format."}
 
-
 # ----------------------------- Routes -----------------------------
 
 @routine_bp.route("/routine", methods=["POST"])
 def save_routine():
+    """
+    Upserts the CURRENT routine to user_routines/{uid}.
+    Body: { time?: ["morning","evening"], products: [{id: "..."}] }
+    """
     uid, err = _bearer_uid_or_401()
     if err: return err
     try:
@@ -111,15 +115,24 @@ def save_routine():
         if not isinstance(products, list):
             return jsonify({"error": "products must be a list"}), 400
 
-        user_ref = firestore_client.collection("users").document(uid)
-        snap = user_ref.get()
-        current = _normalize_routine((snap.to_dict() or {}).get("routine"))
+        doc_ref = _routine_doc(uid)
+        snap = doc_ref.get()
+        current = _normalize_routine(snap.to_dict())
+
         new_routine = {
             "time": time,
-            "products": [{"id": (p.get("id") or "").strip()} for p in products if (p.get("id") or "").strip()],
-            "plan": current.get("plan", {}),
+            "products": {
+                "am": [{"id": (p.get("id") or "").strip()} for p in (data.get("products_am") or []) if (p.get("id") or "").strip()],
+                "pm": [{"id": (p.get("id") or "").strip()} for p in (data.get("products_pm") or []) if (p.get("id") or "").strip()],
+            } if any(k in data for k in ("products_am","products_pm")) else {
+                # fallback if client still sends flat list -> treat as AM
+                "am": [{"id": (p.get("id") or "").strip()} for p in products if (p.get("id") or "").strip()],
+                "pm": current.get("products", {}).get("pm", [])
+            },
+            "plan": current.get("plan", {}),  # preserve plan unless caller overwrites explicitly
         }
-        user_ref.set({"routine": new_routine}, merge=True)
+
+        doc_ref.set(new_routine)
         return jsonify({"message": "Routine saved", "routine": new_routine}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -127,75 +140,89 @@ def save_routine():
 
 @routine_bp.route("/routine", methods=["GET"])
 def get_routine():
-    """Retrieves a user's saved skincare routine: returns {routine:{time, products, plan}}"""
+    """
+    Returns current routine from user_routines/{uid}.
+    If old users.{routine} exists, migrates it once into user_routines/{uid}.
+    """
     uid, err = _bearer_uid_or_401()
-    if err:
-        return err
+    if err: return err
     try:
-        doc = firestore_client.collection("users").document(uid).get()
-        if not doc.exists:
-            return jsonify({"routine": _normalize_routine({})}), 200
-        routine = _normalize_routine(doc.to_dict().get("routine", {}))
+        doc_ref = _routine_doc(uid)
+        snap = doc_ref.get()
+
+        if not snap.exists:
+            # migrate from legacy users.{routine} if present
+            legacy = firestore_client.collection("users").document(uid).get().to_dict() or {}
+            legacy_norm = _normalize_routine(legacy.get("routine"))
+            if legacy.get("routine"):
+                doc_ref.set(legacy_norm)
+            routine = legacy_norm
+        else:
+            routine = _normalize_routine(snap.to_dict())
+
         return jsonify({"routine": routine}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# app/routes/routine.py (replace the two routes)
 
 @routine_bp.route("/routine/add/<product_id>", methods=["POST"])
 def add_product_to_routine(product_id):
-    """Adds a product ID to the user's routine, preserving time/plan."""
     uid, err = _bearer_uid_or_401()
-    if err:
-        return err
+    if err: return err
 
     product_id = (product_id or "").strip()
+    slot = (request.args.get("time") or "am").strip().lower()
+    if slot not in ("am", "pm"):
+        return jsonify({"error": "time must be 'am' or 'pm'"}), 400
     if not product_id:
         return jsonify({"error": "Invalid product id"}), 400
 
     try:
-        user_ref = firestore_client.collection("users").document(uid)
-        snap = user_ref.get()
-        data = snap.to_dict() or {}
-        routine = _normalize_routine(data.get("routine"))
+        doc_ref = _routine_doc(uid)
+        snap = doc_ref.get()
+        routine = _normalize_routine(snap.to_dict())
 
-        # Normalize when checking
-        existing_ids = {(p.get("id") or "").strip() for p in routine["products"]}
-        if product_id in existing_ids:
-            return jsonify({"error": "Product already in routine"}), 400
+        ids = { (p.get("id") or "").strip() for p in routine["products"][slot] }
+        if product_id in ids:
+            return jsonify({"error": "Product already in this slot"}), 400
 
-        routine["products"].append({"id": product_id})
-        user_ref.set({"routine": routine}, merge=True)
-        return jsonify({"message": "Product added to routine", "routine": routine}), 200
-
+        routine["products"][slot].append({"id": product_id})
+        doc_ref.set(routine)
+        return jsonify({"message": "Product added", "routine": routine}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @routine_bp.route("/routine/remove/<product_id>", methods=["DELETE"])
 def delete_product_from_routine(product_id):
-    """Removes a product ID from the user's routine, preserving time/plan."""
     uid, err = _bearer_uid_or_401()
-    if err:
-        return err
+    if err: return err
 
     product_id = (product_id or "").strip()
+    slot = request.args.get("time")
+    if slot is not None:
+        slot = slot.strip().lower()
+        if slot not in ("am", "pm"):
+            return jsonify({"error": "time must be 'am' or 'pm'"}), 400
     if not product_id:
         return jsonify({"error": "Invalid product id"}), 400
 
     try:
-        user_ref = firestore_client.collection("users").document(uid)
-        snap = user_ref.get()
-        data = snap.to_dict() or {}
-        routine = _normalize_routine(data.get("routine"))
+        doc_ref = _routine_doc(uid)
+        snap = doc_ref.get()
+        routine = _normalize_routine(snap.to_dict())
 
-        routine["products"] = [
-            p for p in routine["products"]
-            if (p.get("id") or "").strip() != product_id
-        ]
-        user_ref.set({"routine": routine}, merge=True)
-        return jsonify({"message": "Product removed from routine", "routine": routine}), 200
+        def _strip(arr):
+            return [p for p in arr if (p.get("id") or "").strip() != product_id]
 
+        if slot:
+            routine["products"][slot] = _strip(routine["products"][slot])
+        else:
+            routine["products"]["am"] = _strip(routine["products"]["am"])
+            routine["products"]["pm"] = _strip(routine["products"]["pm"])
+
+        doc_ref.set(routine)
+        return jsonify({"message": "Product removed", "routine": routine}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -203,29 +230,19 @@ def delete_product_from_routine(product_id):
 @routine_bp.route("/routine/generate", methods=["POST"])
 def generate_routine():
     """
-    Generates a new skincare routine plan (morning/evening) based on the user's products.
-    Writes under routine.plan, preserving routine.products membership.
+    Generates a plan and stores under user_routines/{uid}.plan (keeps products/time).
     """
     uid, err = _bearer_uid_or_401()
-    if err:
-        return err
+    if err: return err
     try:
-        user_ref = firestore_client.collection("users").document(uid)
-        user_doc = user_ref.get()
-        if not user_doc.exists:
-            return jsonify({"error": "User not found"}), 404
-
+        # Gather products from either user_products join or embedded somewhere else
+        user_doc = firestore_client.collection("users").document(uid).get()
         user_data = user_doc.to_dict() or {}
-
-        # Try products embedded on user doc (if you store them there)
         products_info = user_data.get("products", [])
 
-        # Fallback: join via user_products -> products collection
         if not products_info:
             links = list(
-                firestore_client.collection("user_products")
-                .where("uid", "==", uid)
-                .stream()
+                firestore_client.collection("user_products").where("uid", "==", uid).stream()
             )
             product_ids = [d.to_dict().get("product_id") for d in links if d.to_dict().get("product_id")]
             products_info = []
@@ -247,10 +264,130 @@ def generate_routine():
         if "error" in generated_plan:
             return jsonify(generated_plan), 500
 
-        # Merge ONLY the plan; keep time/products intact
-        user_ref.set({"routine": {"plan": generated_plan}}, merge=True)
+        doc_ref = _routine_doc(uid)
+        snap = doc_ref.get()
+        routine = _normalize_routine(snap.to_dict())
+        routine["plan"] = generated_plan
+        doc_ref.set(routine)
 
         return jsonify({"message": "New routine generated and saved.", "routine": {"plan": generated_plan}}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
+
+@routine_bp.route("/routine/status", methods=["POST"])
+def mark_product_applied():
+    """
+    Mark product as applied for {uid, date, slot} in user_routine_status.
+    Body: { "product_id": "...", "time": "am"/"pm", "date"?: "YYYY-MM-DD" }
+    """
+    uid, err = _bearer_uid_or_401()
+    if err: return err
+    data = request.get_json() or {}
+    product_id = (data.get("product_id") or "").strip()
+    slot = (data.get("time") or "am").strip().lower()
+    if slot not in ("am", "pm"):
+        return jsonify({"error": "time must be 'am' or 'pm'"}), 400
+    if not product_id:
+        return jsonify({"error": "Missing product_id"}), 400
+    date_str = (data.get("date") or _today_date_str()).strip()
+
+    try:
+        status_ref = _status_doc(date_str, uid)
+        status_doc = status_ref.get()
+        status = status_doc.to_dict() if status_doc.exists else {"uid": uid, "date": date_str, "am": [], "pm": []}
+        if product_id not in status.get(slot, []):
+            status.setdefault(slot, []).append(product_id)
+        status_ref.set(status)
+        return jsonify({"message": "Product marked as applied", "status": status}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@routine_bp.route("/routine/status/unmark", methods=["POST"])
+def unmark_product_applied():
+    uid, err = _bearer_uid_or_401()
+    if err: return err
+    data = request.get_json() or {}
+    product_id = (data.get("product_id") or "").strip()
+    slot = (data.get("time") or "am").strip().lower()
+    date_str = (data.get("date") or datetime.utcnow().strftime("%Y-%m-%d")).strip()
+    if slot not in ("am","pm"): return jsonify({"error":"time must be 'am' or 'pm'"}), 400
+    if not product_id: return jsonify({"error":"Missing product_id"}), 400
+
+    try:
+        status_ref = firestore_client.collection("user_routine_status").document(f"{uid}_{date_str}")
+        status_doc = status_ref.get()
+        status = status_doc.to_dict() if status_doc.exists else {"uid": uid, "date": date_str, "am": [], "pm": []}
+        status[slot] = [pid for pid in status.get(slot, []) if pid != product_id]
+        status_ref.set(status)
+        return jsonify({"message": "Product unmarked", "status": status}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@routine_bp.route("/routine/status", methods=["GET"])
+def get_today_routine_status():
+    """
+    Returns status for ?date=YYYY-MM-DD (default today) + completion % using user_routines/{uid}.
+    """
+    uid, err = _bearer_uid_or_401()
+    if err: return err
+    date_str = (request.args.get("date") or _today_date_str()).strip()
+    try:
+        routine = _normalize_routine(_routine_doc(uid).get().to_dict())
+        products = routine["products"]
+
+        status_doc = _status_doc(date_str, uid).get()
+        status = status_doc.to_dict() if status_doc.exists else {"am": [], "pm": []}
+
+        def _completion(slot):
+            total = len(products[slot])
+            done = len([p for p in products[slot] if p["id"] in status.get(slot, [])])
+            return (done / total * 100) if total else 0
+
+        return jsonify({
+            "date": date_str,
+            "status": {"am": status.get("am", []), "pm": status.get("pm", [])},
+            "completion": {"am": _completion("am"), "pm": _completion("pm")},
+            "routine": products
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@routine_bp.route("/routine/status/monthly", methods=["GET"])
+def get_monthly_routine_status():
+    """
+    Aggregates daily status docs for given month; uses user_routines/{uid} to compute completion each day.
+    Query: ?year=YYYY&month=MM
+    """
+    uid, err = _bearer_uid_or_401()
+    if err: return err
+    try:
+        now = datetime.utcnow()
+        year = int(request.args.get("year") or now.year)
+        month = int(request.args.get("month") or now.month)
+        days = _month_range(year, month)
+
+        products = _normalize_routine(_routine_doc(uid).get().to_dict())["products"]
+
+        results = []
+        for day in days:
+            date_str = day.strftime("%Y-%m-%d")
+            sdoc = _status_doc(date_str, uid).get()
+            status = sdoc.to_dict() if sdoc.exists else {"am": [], "pm": []}
+
+            def _completion(slot):
+                total = len(products[slot])
+                done = len([p for p in products[slot] if p["id"] in status.get(slot, [])])
+                return (done / total * 100) if total else 0
+
+            results.append({
+                "date": date_str,
+                "status": {"am": status.get("am", []), "pm": status.get("pm", [])},
+                "completion": {"am": _completion("am"), "pm": _completion("pm")}
+            })
+
+        return jsonify({"month": f"{year}-{month:02d}", "days": results}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
